@@ -634,6 +634,12 @@ bool Print::invalidate_state_by_config_options(const ConfigOptionResolver & /* n
         else if (opt_key == "z_hop_types") {
             osteps.emplace_back(posDetectOverhangsForLift);
         }
+        else if (opt_key == "share_process_settings") {
+            // A different process column can change flow-dependent paths and speeds.
+            invalidated |= this->invalidate_all_steps();
+            for (PrintObject* object : m_objects)
+                invalidated |= object->invalidate_all_steps();
+        }
         // The bed-zone colour scheme and the advisory margin bands are drawn from the printer
         // config but never reach the slice: compute_imex_zone_layout keeps the margin out of
         // primary_zone_box, which is the only part of the layout update_imex_slice_offset reads.
@@ -7281,3 +7287,4 @@ void WipeTowerData::construct_mesh(float width, float depth, float height, float
 }
 
 } // namespace Slic3r
+

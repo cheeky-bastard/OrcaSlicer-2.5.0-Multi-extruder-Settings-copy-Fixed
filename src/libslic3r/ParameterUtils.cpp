@@ -64,6 +64,9 @@ int get_index_for_extruder_parameter(const DynamicPrintConfig &config, const std
         // id_name      = "filament_extruder_id";
         variant_name = "filament_extruder_variant";
     } else if (print_options_with_variant.count(opt_key) > 0) {
+        const auto* shared = config.option<ConfigOptionBool>("share_process_settings");
+        if (shared && shared->value)
+            return 0;
         id_name      = "print_extruder_id";
         variant_name = "print_extruder_variant";
     } else {
@@ -81,3 +84,4 @@ int get_index_for_extruder_parameter(const DynamicPrintConfig &config, const std
 }
 
 }; // namespace Slic3r
+

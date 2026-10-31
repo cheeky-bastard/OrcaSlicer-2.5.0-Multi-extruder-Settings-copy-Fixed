@@ -4,6 +4,7 @@
 #include <vector>
 #include <set>
 #include <cmath>
+#include <cstddef>
 
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers.hpp>
@@ -12,6 +13,7 @@
 #include <catch2/catch_approx.hpp>
 #include "libslic3r/PrintConfig.hpp"
 #include "libslic3r/Preset.hpp"
+#include "slic3r/GUI/ProcessSettingsSync.hpp"
 
 using namespace Slic3r;
 
@@ -882,4 +884,248 @@ TEST_CASE("The mixed filament metadata is sized to the filament count", "[Config
     resize_mixed_filament_metadata(config, 2, 4);
     REQUIRE(config.option<ConfigOptionBools>("filament_is_mixed")->values == std::vector<unsigned char>({false, false, false, false}));
     REQUIRE(config.option<ConfigOptionStrings>("filament_mixed_components")->values == std::vector<std::string>({"", "", "", ""}));
+}
+
+TEST_CASE("Shared process settings change only process values in the slicing copy", "[Config][ProcessVariants][SharedProcess]")
+{
+    DynamicPrintConfig profile;
+    const std::vector<std::string> variants{"Direct Drive Standard", "Direct Drive High Flow", "Bowden Standard", "Bowden High Flow"};
+    profile.option<ConfigOptionInts>("print_extruder_id", true)->values = {1, 2, 3, 4};
+    profile.option<ConfigOptionStrings>("print_extruder_variant", true)->values = variants;
+    profile.option<ConfigOptionFloats>("outer_wall_speed", true)->values = {30., 60., 90., 120.};
+    profile.option<ConfigOptionFloats>("default_acceleration", true)->values = {500., 1000., 1500., 2000.};
+    profile.option<ConfigOptionFloats>("nozzle_diameter", true)->values = {0.4, 0.6, 0.8, 1.0};
+    profile.option<ConfigOptionFloats>("retraction_length", true)->values = {0.5, 1., 1.5, 2.};
+    profile.option<ConfigOptionInts>("nozzle_temperature", true)->values = {200, 210, 220, 230};
+    profile.option<ConfigOptionFloats>("filament_max_volumetric_speed", true)->values = {10., 20., 30., 40.};
+    profile.option<ConfigOptionInts>("filament_map", true)->values = {1, 2, 3, 4};
+    profile.option<ConfigOptionBool>("share_process_settings", true)->value = true;
+    DynamicPrintConfig slicing = profile;
+    slicing.apply_shared_process_settings();
+    for (size_t tool = 0; tool < 4; ++tool) {
+        DYNAMIC_SECTION("Only process values are shared for tool " << tool + 1) {
+            REQUIRE_THAT(slicing.option<ConfigOptionFloats>("outer_wall_speed")->get_at(tool), Catch::Matchers::WithinAbs(30., 0.0001));
+            REQUIRE_THAT(slicing.option<ConfigOptionFloats>("default_acceleration")->get_at(tool), Catch::Matchers::WithinAbs(500., 0.0001));
+            REQUIRE_THAT(profile.option<ConfigOptionFloats>("outer_wall_speed")->get_at(tool), Catch::Matchers::WithinAbs(30. * (tool + 1), 0.0001));
+        }
+    }
+    for (const char* key : {"print_extruder_id", "print_extruder_variant", "nozzle_diameter", "retraction_length",
+                            "nozzle_temperature", "filament_max_volumetric_speed", "filament_map"}) {
+        DYNAMIC_SECTION("Independent hardware, filament or mapping option " << key) {
+            REQUIRE(slicing.option(key)->serialize() == profile.option(key)->serialize());
+        }
+    }
+    profile.option<ConfigOptionBool>("share_process_settings")->value = false;
+    profile.apply_shared_process_settings();
+    REQUIRE_THAT(profile.option<ConfigOptionFloats>("outer_wall_speed")->get_at(3), Catch::Matchers::WithinAbs(120., 0.0001));
+}
+
+TEST_CASE("Shared process settings default off and belong to saved print profiles", "[Config][ProcessVariants][SharedProcess]")
+{
+    const auto* definition = print_config_def.get("share_process_settings");
+    REQUIRE(definition != nullptr);
+    REQUIRE_FALSE(static_cast<const ConfigOptionBool*>(definition->default_value.get())->value);
+    bool saved_with_process = false;
+    for (const auto& key : Preset::print_options())
+        saved_with_process |= key == "share_process_settings";
+    REQUIRE(saved_with_process);
+    PrintConfig config;
+    REQUIRE_FALSE(config.share_process_settings.value);
+}
+
+
+TEST_CASE("A single-column process expands to four identical tools without losing existing speeds", "[Config][ProcessVariants][SharedProcess]")
+{
+    DynamicPrintConfig printer;
+    printer.option<ConfigOptionStrings>("extruder_variant_list", true)->values = std::vector<std::string>(4, "Direct Drive Standard");
+    DynamicPrintConfig process;
+    process.option<ConfigOptionInts>("print_extruder_id", true)->values = {1};
+    process.option<ConfigOptionStrings>("print_extruder_variant", true)->values = {"Direct Drive Standard"};
+    process.option<ConfigOptionFloats>("outer_wall_speed", true)->values = {45.};
+    process.ensure_process_variant_columns(printer);
+    REQUIRE(process.option<ConfigOptionInts>("print_extruder_id")->values == std::vector<int>{1, 2, 3, 4});
+    const auto* speeds = process.option<ConfigOptionFloats>("outer_wall_speed");
+    REQUIRE(speeds->size() == 4);
+    for (double speed : speeds->values)
+        REQUIRE_THAT(speed, Catch::Matchers::WithinAbs(45., 0.0001));
+    process.option<ConfigOptionFloats>("outer_wall_speed")->values[2] = 75.;
+    process.ensure_process_variant_columns(printer);
+    REQUIRE_THAT(speeds->get_at(2), Catch::Matchers::WithinAbs(75., 0.0001));
+}
+
+TEST_CASE("Process tool synchronization copies saved first-layer and outer-wall speeds", "[Config][ProcessSync]")
+{
+    DynamicPrintConfig profile = DynamicPrintConfig::full_print_config();
+    profile.option<ConfigOptionFloats>("initial_layer_speed")->values = {50., 61., 72., 83.};
+    profile.option<ConfigOptionFloats>("initial_layer_infill_speed")->values = {105., 116., 127., 138.};
+    profile.option<ConfigOptionFloats>("outer_wall_speed")->values = {200., 211., 222., 233.};
+    profile.option<ConfigOptionFloats>("inner_wall_speed")->values = {500., 400., 300., 200.};
+    const DynamicPrintConfig saved = profile;
+    const t_config_option_keys page{"initial_layer_speed", "initial_layer_infill_speed", "outer_wall_speed", "inner_wall_speed"};
+    for (int source = 0; source < 4; ++source) {
+        for (int target = 0; target < 4; ++target) {
+            if (source == target) continue;
+            DYNAMIC_SECTION("Saved source tool " << source << " to tool " << target) {
+                REQUIRE(profile.diff(saved).empty());
+                const auto changes = GUI::process_tool_sync_changes(profile, page, source, target);
+                REQUIRE(changes.keys().size() == page.size());
+                DynamicPrintConfig copied = profile;
+                copied.apply(changes);
+                for (const auto& key : page) {
+                    const auto* before = profile.option<ConfigOptionFloats>(key);
+                    const auto* after = copied.option<ConfigOptionFloats>(key);
+                    for (int tool = 0; tool < 4; ++tool)
+                        REQUIRE_THAT(after->get_at(tool), Catch::Matchers::WithinAbs(before->get_at(tool == target ? source : tool), 0.000001));
+                }
+                REQUIRE(copied.option("layer_height")->serialize() == profile.option("layer_height")->serialize());
+                REQUIRE(profile.diff(saved).empty());
+                REQUIRE(GUI::process_tool_sync_changes(copied, page, source, target).empty());
+            }
+        }
+    }
+}
+
+TEST_CASE("Process page synchronization excludes hardware, filament, mapping and invalid indices", "[Config][ProcessSync]")
+{
+    DynamicPrintConfig profile = DynamicPrintConfig::full_print_config();
+    profile.option<ConfigOptionFloats>("outer_wall_speed")->values = {200., 150., 100., 50.};
+    profile.option<ConfigOptionInts>("print_extruder_id")->values = {1, 2, 3, 4};
+    profile.option<ConfigOptionStrings>("print_extruder_variant")->values = std::vector<std::string>(4, "Direct Drive Standard");
+    profile.option<ConfigOptionFloats>("nozzle_diameter")->values = {0.4, 0.4, 0.8, 0.8};
+    profile.option<ConfigOptionInts>("nozzle_temperature")->values = {210, 220, 230, 240};
+    profile.option<ConfigOptionInts>("filament_map")->values = {4, 3, 2, 1};
+    const t_config_option_keys keys{"outer_wall_speed", "print_extruder_id", "print_extruder_variant",
+        "nozzle_diameter", "nozzle_temperature", "filament_map", "share_process_settings", "unknown_option"};
+    const auto changes = GUI::process_tool_sync_changes(profile, keys, 0, 3);
+    REQUIRE(changes.keys() == t_config_option_keys{"outer_wall_speed"});
+    DynamicPrintConfig copied = profile;
+    copied.apply(changes);
+    for (const auto& key : keys) {
+        if (key != "outer_wall_speed" && profile.option(key))
+            REQUIRE(copied.option(key)->serialize() == profile.option(key)->serialize());
+    }
+    REQUIRE(GUI::process_tool_sync_changes(profile, keys, -1, 0).empty());
+    REQUIRE(GUI::process_tool_sync_changes(profile, keys, 0, -1).empty());
+    REQUIRE(GUI::process_tool_sync_changes(profile, keys, 0, 0).empty());
+    REQUIRE(GUI::process_tool_sync_changes(profile, keys, 4, 0).empty());
+    REQUIRE(GUI::process_tool_sync_changes(profile, keys, 0, 4).empty());
+    REQUIRE(GUI::process_tool_sync_changes(profile, {}, 0, 3).empty());
+}
+
+TEST_CASE("Process columns and synchronization follow the configured tool count beyond four", "[Config][ProcessSync]")
+{
+    for (int count : {2,3,4,5,6,8,12}) {
+        DYNAMIC_SECTION("Configured tool count " << count) {
+            DynamicPrintConfig printer, process;
+            printer.option<ConfigOptionStrings>("extruder_variant_list", true)->values = std::vector<std::string>(count, "Direct Drive Standard");
+            process.option<ConfigOptionInts>("print_extruder_id", true)->values = {1};
+            process.option<ConfigOptionStrings>("print_extruder_variant", true)->values = {"Direct Drive Standard"};
+            process.option<ConfigOptionFloats>("outer_wall_speed", true)->values = {200.};
+            process.option<ConfigOptionFloats>("initial_layer_speed", true)->values = {50.};
+            process.ensure_process_variant_columns(printer);
+            REQUIRE(process.option<ConfigOptionInts>("print_extruder_id")->size() == size_t(count));
+            process.option<ConfigOptionFloats>("outer_wall_speed")->values.back() = 99.;
+            process.option<ConfigOptionFloats>("initial_layer_speed")->values.back() = 25.;
+            const auto changes = GUI::process_tool_sync_changes(process, {"outer_wall_speed", "initial_layer_speed"}, 0, count-1);
+            REQUIRE(changes.keys().size() == 2);
+            process.apply(changes);
+            REQUIRE_THAT(process.option<ConfigOptionFloats>("outer_wall_speed")->get_at(count-1), Catch::Matchers::WithinAbs(200., 0.000001));
+            REQUIRE_THAT(process.option<ConfigOptionFloats>("initial_layer_speed")->get_at(count-1), Catch::Matchers::WithinAbs(50., 0.000001));
+            REQUIRE(process.option<ConfigOptionFloats>("outer_wall_speed")->size() == size_t(count));
+        }
+    }
+}
+
+TEST_CASE("Process speed copying reaches every configured destination through twelve tools", "[Config][ProcessSync][ThroughTwelve]")
+{
+    const int count = GENERATE(2, 6, 8, 12);
+    CAPTURE(count);
+    DynamicPrintConfig printer, profile;
+    printer.option<ConfigOptionStrings>("extruder_variant_list", true)->values.assign(count, "Direct Drive Standard");
+    profile.option<ConfigOptionInts>("print_extruder_id", true)->values = {1};
+    profile.option<ConfigOptionStrings>("print_extruder_variant", true)->values = {"Direct Drive Standard"};
+    const t_config_option_keys page{"initial_layer_speed", "initial_layer_infill_speed", "outer_wall_speed"};
+    for (const auto& key : page)
+        profile.option<ConfigOptionFloats>(key, true)->values = {30.};
+    profile.ensure_process_variant_columns(printer);
+    const auto mapping = profile.option<ConfigOptionInts>("print_extruder_id")->values;
+    const auto variants = profile.option<ConfigOptionStrings>("print_extruder_variant")->values;
+    REQUIRE(mapping.size() == size_t(count));
+    for (int tool = 0; tool < count; ++tool)
+        REQUIRE(profile.get_index_for_extruder(tool + 1, "print_extruder_id", etDirectDrive,
+                                               nvtStandard, "print_extruder_variant") == tool);
+    for (size_t k = 0; k < page.size(); ++k) {
+        auto& speeds = profile.option<ConfigOptionFloats>(page[k])->values;
+        REQUIRE(speeds.size() == size_t(count));
+        for (int tool = 0; tool < count; ++tool)
+            speeds[tool] = 30. + 50. * k + tool;
+    }
+    profile.option<ConfigOptionFloats>("nozzle_diameter", true)->values.assign(count, 0.4);
+    profile.option<ConfigOptionInts>("nozzle_temperature", true)->values.assign(count, 215);
+    profile.option<ConfigOptionFloats>("top_surface_speed", true)->values.assign(count, 24.);
+    for (int source = 0; source < count; ++source) {
+        for (int target = 0; target < count; ++target) {
+            if (source == target)
+                continue;
+            CAPTURE(source, target);
+            const auto changes = GUI::process_tool_sync_changes(profile, page, source, target);
+            REQUIRE(changes.keys().size() == page.size());
+            DynamicPrintConfig copied = profile;
+            copied.apply(changes);
+            for (const auto& key : page) {
+                for (int tool = 0; tool < count; ++tool) {
+                    const double expected = profile.option<ConfigOptionFloats>(key)->get_at(tool == target ? source : tool);
+                    REQUIRE_THAT(copied.option<ConfigOptionFloats>(key)->get_at(tool), Catch::Matchers::WithinAbs(expected, 0.000001));
+                }
+            }
+            REQUIRE(copied.option<ConfigOptionInts>("print_extruder_id")->values == mapping);
+            REQUIRE(copied.option<ConfigOptionStrings>("print_extruder_variant")->values == variants);
+            for (const char* key : {"nozzle_diameter", "nozzle_temperature", "top_surface_speed"})
+                REQUIRE(*copied.option(key) == *profile.option(key));
+            REQUIRE(GUI::process_tool_sync_changes(copied, page, source, target).empty());
+        }
+    }
+}
+
+TEST_CASE("Process synchronization offers every compatible active tool through twelve tools", "[Config][ProcessSync]")
+{
+    const int count = GENERATE(1, 2, 4, 6, 8, 12);
+    CAPTURE(count);
+    const std::vector<int> nozzles(count, nvtStandard);
+    const std::vector<int> drives(count, etDirectDrive);
+    for (int source = 0; source < count; ++source) {
+        CAPTURE(source);
+        const auto targets = GUI::process_tool_sync_targets(count, source, nozzles, drives, nvtStandard);
+        std::vector<int> expected;
+        for (int target = 0; target < count; ++target)
+            if (target != source)
+                expected.push_back(target);
+        REQUIRE(targets == expected);
+    }
+}
+
+TEST_CASE("Process synchronization retains nozzle and drive compatibility", "[Config][ProcessSync]")
+{
+    const std::vector<int> nozzles{nvtStandard, nvtHighFlow, nvtHybrid, nvtStandard, nvtHighFlow, nvtHybrid};
+    const std::vector<int> drives{etDirectDrive, etDirectDrive, etDirectDrive, etBowden, etBowden, etBowden};
+    REQUIRE(GUI::process_tool_sync_targets(6, 0, nozzles, drives, nvtStandard) == std::vector<int>{2});
+    REQUIRE(GUI::process_tool_sync_targets(6, 1, nozzles, drives, nvtHighFlow) == std::vector<int>{2});
+    REQUIRE(GUI::process_tool_sync_targets(6, 2, nozzles, drives, nvtStandard) == std::vector<int>{0});
+    REQUIRE(GUI::process_tool_sync_targets(6, 2, nozzles, drives, nvtHighFlow) == std::vector<int>{1});
+    REQUIRE(GUI::process_tool_sync_targets(6, 5, nozzles, drives, nvtStandard) == std::vector<int>{3});
+    REQUIRE(GUI::process_tool_sync_targets(6, 5, nozzles, drives, nvtHighFlow) == std::vector<int>{4});
+}
+
+TEST_CASE("Process synchronization rejects inactive and incomplete tool layouts", "[Config][ProcessSync]")
+{
+    const std::vector<int> nozzles(12, nvtStandard);
+    const std::vector<int> drives(12, etDirectDrive);
+    REQUIRE(GUI::process_tool_sync_targets(3, 0, nozzles, drives, nvtStandard) == std::vector<int>{1, 2});
+    REQUIRE(GUI::process_tool_sync_targets(3, 3, nozzles, drives, nvtStandard).empty());
+    REQUIRE(GUI::process_tool_sync_targets(12, -1, nozzles, drives, nvtStandard).empty());
+    REQUIRE(GUI::process_tool_sync_targets(12, 12, nozzles, drives, nvtStandard).empty());
+    REQUIRE(GUI::process_tool_sync_targets(0, 0, nozzles, drives, nvtStandard).empty());
+    REQUIRE(GUI::process_tool_sync_targets(12, 0, {}, drives, nvtStandard).empty());
+    REQUIRE(GUI::process_tool_sync_targets(12, 0, nozzles, {}, nvtStandard).empty());
+    REQUIRE(GUI::process_tool_sync_targets(12, 0, std::vector<int>(8, nvtStandard), drives, nvtStandard).empty());
 }

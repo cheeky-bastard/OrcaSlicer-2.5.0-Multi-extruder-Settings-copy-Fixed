@@ -2262,3 +2262,44 @@ TEST_CASE("Nozzle change ramming is symmetric for identical filaments", "[MultiF
     }
     CHECK_THAT(medians[0], Catch::Matchers::WithinRel(medians[1], 0.01));
 }
+
+TEST_CASE("Sharing process settings changes process columns without changing four-tool filament routing", "[MultiFilament][SharedProcess]")
+{
+    DynamicPrintConfig config = multifilament_config(4);
+    config.set_deserialize_strict({
+        {"nozzle_diameter", "0.4,0.4,0.4,0.4"},
+        {"printer_extruder_id", "1,2,3,4"},
+        {"print_extruder_id", "1,2,3,4"},
+        {"filament_map", "1,2,3,4"},
+        {"outer_wall_speed", "20,35,50,65"},
+        {"extruder_printable_height", "0,0,0,0"},
+        {"share_process_settings", "0"},
+    });
+    config.option<ConfigOptionStrings>("printer_extruder_variant", true)->values = std::vector<std::string>(4, "Direct Drive Standard");
+    config.option<ConfigOptionStrings>("print_extruder_variant", true)->values = std::vector<std::string>(4, "Direct Drive Standard");
+    config.option<ConfigOptionEnumsGeneric>("extruder_type", true)->values = {etDirectDrive, etDirectDrive, etDirectDrive, etDirectDrive};
+    config.option<ConfigOptionEnumsGeneric>("nozzle_volume_type", true)->values = {nvtStandard, nvtStandard, nvtStandard, nvtStandard};
+    config.option<ConfigOptionStrings>("extruder_variant_list", true)->values = std::vector<std::string>(4, "Direct Drive Standard");
+    size_flush_to_nozzles(config);
+    Print print;
+    Model model;
+    init_print({cube(20)}, print, model, config);
+    const std::vector<double> independent_speeds{20., 35., 50., 65.};
+    for (size_t tool = 0; tool < independent_speeds.size(); ++tool)
+        REQUIRE_THAT(print.default_region_config().outer_wall_speed.get_at(tool), Catch::Matchers::WithinAbs(independent_speeds[tool], 0.0001));
+    REQUIRE(print.config().filament_map_2.values == std::vector<int>{0, 1, 2, 3});
+    REQUIRE(print.config().filament_map.values == std::vector<int>{1, 2, 3, 4});
+    config.set_deserialize_strict({{"share_process_settings", "1"}, {"gcode_comments", "1"}});
+    print.apply(model, config);
+    REQUIRE(print.config().filament_map_2.values == std::vector<int>{0, 1, 2, 3});
+    for (size_t tool = 0; tool < 4; ++tool)
+        REQUIRE_THAT(print.default_region_config().outer_wall_speed.get_at(tool), Catch::Matchers::WithinAbs(20., 0.0001));
+    REQUIRE(print.config().filament_map.values == std::vector<int>{1, 2, 3, 4});
+    REQUIRE(print.config().nozzle_diameter.size() == 4);
+    config.set_deserialize_strict({{"share_process_settings", "0"}});
+    print.apply(model, config);
+    REQUIRE(print.config().filament_map_2.values == std::vector<int>{0, 1, 2, 3});
+    REQUIRE(print.config().filament_map.values == std::vector<int>{1, 2, 3, 4});
+    for (size_t tool = 0; tool < independent_speeds.size(); ++tool)
+        REQUIRE_THAT(print.default_region_config().outer_wall_speed.get_at(tool), Catch::Matchers::WithinAbs(independent_speeds[tool], 0.0001));
+}

@@ -1335,6 +1335,7 @@ void Print::update_shrinkage_compensation(size_t num_extruders, std::vector<int>
 
 Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_config, bool extruder_applied)
 {
+    new_full_config.apply_shared_process_settings();
 #ifdef _DEBUG
     check_model_ids_validity(model);
 #endif /* _DEBUG */
@@ -1464,6 +1465,10 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
             print_variant_index[e_index] = e_index;
         }
     }
+
+    // Object, part and layer overrides share their first process column as well.
+    if (const auto* shared = new_full_config.option<ConfigOptionBool>("share_process_settings"); shared && shared->value)
+        std::fill(print_variant_index.begin(), print_variant_index.end(), 0);
 
     // Fill in physical_extruder_map when the printer profile has not authored one. It has one
     // entry per logical extruder, so it is sized from the nozzle count -- not from
@@ -2285,3 +2290,4 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
 }
 
 } // namespace Slic3r
+

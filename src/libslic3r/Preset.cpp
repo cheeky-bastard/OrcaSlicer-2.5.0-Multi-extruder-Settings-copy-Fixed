@@ -1280,6 +1280,7 @@ static std::vector<std::string> s_Preset_print_options{
     "raft_layers", "raft_first_layer_density", "raft_first_layer_expansion", "raft_contact_distance", "raft_expansion",
     "support_base_pattern", "support_base_pattern_spacing", "support_expansion", "support_style",
     // BBS
+    "share_process_settings",
     "print_extruder_id",
     "print_extruder_variant",
     "independent_support_layer_height",
@@ -5264,3 +5265,4 @@ namespace PresetUtils {
 } // namespace PresetUtils
 
 } // namespace Slic3r
+

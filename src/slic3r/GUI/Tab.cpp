@@ -1,5 +1,6 @@
 //#include "slic3r/Utils/Serial.hpp"
 #include "Tab.hpp"
+#include "ProcessSettingsSync.hpp"
 #include "PresetHints.hpp"
 #include "libslic3r/IMEXHelpers.hpp"
 #include "libslic3r/PresetBundle.hpp"
@@ -17,6 +18,7 @@
 #include "libslic3r/Config.hpp"
 #include <boost/any.hpp>
 #include <vector>
+#include <cstddef>
 #include <string>
 #include <utility>
 #include <cassert>
@@ -74,6 +76,7 @@
 #include <wx/imaglist.h>
 #include <wx/settings.h>
 #include <wx/filedlg.h>
+#include "SingleChoiceDialog.hpp"
 
 #include <boost/algorithm/string/predicate.hpp>
 #include <boost/algorithm/string/replace.hpp>
@@ -580,7 +583,9 @@ void Tab::create_preset_tab()
         m_extruder_sync_box->SetToolTip(_L("Synchronization of different extruder drives or nozzle volume types is not supported."));
         m_extruder_sync = nullptr;
         add_scaled_button(m_extruder_sync_box, &m_extruder_sync, "extruder_sync");
-        m_extruder_sync->SetToolTip(_L("Synchronize the modification of parameters to the corresponding parameters of another extruder."));
+        m_extruder_sync->SetToolTip(m_type == Preset::TYPE_PRINT || m_type >= Preset::TYPE_COUNT ?
+            _L("Copy this page's per-tool process settings to another tool, including saved and default values.") :
+            _L("Synchronize the modification of parameters to the corresponding parameters of another extruder."));
         m_extruder_sync->Bind(wxEVT_BUTTON, [this](auto &evt) {
             evt.Skip();
             sync_excluder();
@@ -2142,6 +2147,9 @@ void Tab::on_value_change(const std::string& opt_key, const boost::any& value)
         }
     }
 
+    if (opt_key == "share_process_settings" && m_type == Preset::TYPE_PRINT)
+        update_extruder_variants(-1, true);
+
     if (opt_key == "gcode_flavor" && m_type == Preset::TYPE_PRINTER) {
         if (auto printer_tab = dynamic_cast<TabPrinter*>(this))
             printer_tab->on_gcode_flavor_changed();
@@ -3478,6 +3486,11 @@ void TabPrint::build()
         optgroup->append_single_option_line("fuzzy_skin_ripple_offset", "others_settings_fuzzy_skin#ripple-offset");
         optgroup->append_single_option_line("fuzzy_skin_layers_between_ripple_offset", "others_settings_fuzzy_skin#layers-between-ripple-offset");
         optgroup->append_single_option_line("fuzzy_skin_first_layer", "others_settings_fuzzy_skin#apply-fuzzy-skin-to-first-layer");
+
+        if (m_type == Preset::TYPE_PRINT) {
+            optgroup = page->new_optgroup(L("Tool settings"), L"param_multi_material");
+            optgroup->append_single_option_line("share_process_settings");
+        }
 
         optgroup = page->new_optgroup(L("G-code output"), L"param_gcode");
         optgroup->append_single_option_line("reduce_infill_retraction", "others_settings_g_code_output#reduce-infill-retraction");
@@ -8958,17 +8971,28 @@ void Tab::update_extruder_variants(int extruder_id, bool reload)
     if (m_extruder_switch) {
         auto    nozzle_volumes = m_preset_bundle->project_config.option<ConfigOptionEnumsGeneric>("nozzle_volume_type");
         int extruder_nums = m_preset_bundle->get_printer_extruder_count();
+        if (m_type == Preset::TYPE_PRINT && extruder_nums > 2)
+            m_config->ensure_process_variant_columns(m_preset_bundle->printers.get_edited_preset().config);
         nozzle_volumes->values.resize(extruder_nums);
 
         // Orca: update `m_actual_nozzle_volumes` to current selected ones
         m_actual_nozzle_volumes.resize(extruder_nums, NozzleVolumeType::nvtStandard);
         for (int i = 0; i < extruder_nums; i++) m_actual_nozzle_volumes[i] = (NozzleVolumeType)nozzle_volumes->values[i];
 
-        // Orca: when every extruder uses the same variant (e.g. a non-Bambu dual-nozzle printer), the
-        // switch has no nozzle variants to select and nothing to sync. The printer tab still enables it
-        // to choose the extruder its Extruder and Motion ability pages edit.
-        m_extruder_switch_variants = extruder_nums >= 2 && m_preset_bundle->support_different_extruders();
-        if (m_extruder_switch_variants || (m_type == Preset::TYPE_PRINTER && extruder_nums >= 2)) {
+        // Toolchangers can keep independent process settings even with identical hotends.
+        // Preserve the existing dual-nozzle variant policy for two-tool printers.
+        const bool process_tab = m_type == Preset::TYPE_PRINT || m_type >= Preset::TYPE_COUNT;
+        m_extruder_switch_variants = (process_tab && extruder_nums > 2) ||
+            (extruder_nums >= 2 && m_preset_bundle->support_different_extruders());
+        const auto* shared = m_config->option<ConfigOptionBool>("share_process_settings");
+        const bool shared_process = m_type != Preset::TYPE_PRINTER && m_type != Preset::TYPE_FILAMENT && shared && shared->value;
+        if (shared_process) {
+            m_extruder_switch_variants = false;
+            m_extruder_switch->SetOptions({_L("Shared print settings")});
+            m_extruder_switch->SetSelection(0);
+            m_extruder_switch->Enable(false);
+            m_extruder_sync->Enable(false);
+        } else if (m_extruder_switch_variants || (m_type == Preset::TYPE_PRINTER && extruder_nums >= 2)) {
             auto options = generate_extruder_options();
             m_extruder_switch->SetOptions(options);
             int item_n = options.empty() ? 0 : options.size();
@@ -9218,6 +9242,8 @@ NozzleVolumeType Tab::get_actual_nozzle_volume_type(int extruder_id)
 
 bool Tab::get_extruder_sync_enable_state(int extruder_id)
 {
+    if (m_type == Preset::TYPE_PRINT || m_type >= Preset::TYPE_COUNT)
+        return !get_extruder_sync_targets(extruder_id).empty();
     Preset& printer_preset = m_preset_bundle->printers.get_edited_preset();
     auto nozzle_volumes = m_preset_bundle->project_config.option<ConfigOptionEnumsGeneric>("nozzle_volume_type");
     auto extruders = printer_preset.config.option<ConfigOptionEnumsGeneric>("extruder_type");
@@ -9270,6 +9296,18 @@ bool Tab::get_extruder_sync_enable_state(int extruder_id)
         return false;
     }
     return false;
+}
+
+std::vector<int> Tab::get_extruder_sync_targets(int extruder_id)
+{
+    const auto& printer = m_preset_bundle->printers.get_edited_preset().config;
+    const auto* nozzles = m_preset_bundle->project_config.option<ConfigOptionEnumsGeneric>("nozzle_volume_type");
+    const auto* drives = printer.option<ConfigOptionEnumsGeneric>("extruder_type");
+    const int count = m_preset_bundle->get_printer_extruder_count();
+    if (!nozzles || !drives || count < 2 || extruder_id < 0 || extruder_id >= count)
+        return {};
+    return process_tool_sync_targets(count, extruder_id,
+                                     nozzles->values, drives->values, get_actual_nozzle_volume_type(extruder_id));
 }
 
 bool Tab::variant_switch_active() const
@@ -9328,6 +9366,9 @@ void Tab::switch_excluder(int extruder_id, bool reload)
     }
     auto get_index_for_extruder =
             [this, &extruders, variant_keys = extruder_variant_keys[m_type >= Preset::TYPE_COUNT ? Preset::TYPE_PRINT : m_type]](int extruder_id, int stride = 1) {
+        const auto* shared = m_config->option<ConfigOptionBool>("share_process_settings");
+        if (variant_keys.first == "print_extruder_id" && shared && shared->value)
+            return 0;
         return m_config->get_index_for_extruder(extruder_id + 1, variant_keys.first,
             ExtruderType(extruders->values[extruder_id]), get_actual_nozzle_volume_type(extruder_id), variant_keys.second, stride);
     };
@@ -9392,64 +9433,103 @@ void Tab::sync_excluder()
         return m_config->get_index_for_extruder(extruder_id + 1, variant_keys.first,
             ExtruderType(extruders->values[extruder_id]), nozzle_type, variant_keys.second, stride);
     };
+    const int tool_count = m_preset_bundle->get_printer_extruder_count();
+    const bool copy_process_page = m_type == Preset::TYPE_PRINT || m_type >= Preset::TYPE_COUNT;
     int active_index = get_current_active_extruder();
-    // The button copies to the other toolhead, so it is only offered when that other one exists;
-    // without this the `1 - active_index` below would index an extruder that is not there.
     if (!get_extruder_sync_enable_state(active_index))
         return;
+    const auto targets = copy_process_page ? get_extruder_sync_targets(active_index) : std::vector<int>{1 - active_index};
+    if (targets.empty())
+        return;
+    int target_extruder = targets.front();
+    if (copy_process_page && tool_count > 2) {
+        wxArrayString choices;
+        for (int target : targets)
+            choices.Add(wxString::Format("T%d", target + 1));
+        // TRN: %1% is the source tool label, numbered from one (for example T3).
+        SingleChoiceDialog target_dialog(format_wxstr(_L("Copy parameters from %1% to:"), wxString::Format("T%d", active_index + 1)),
+                                         _L("Copy parameters"), choices, 0, wxGetTopLevelParent(this));
+        target_dialog.CenterOnParent();
+        const int selection = target_dialog.GetSingleChoiceIndex();
+        if (selection < 0 || static_cast<size_t>(selection) >= targets.size())
+            return;
+        target_extruder = targets[static_cast<std::size_t>(selection)];
+    }
     auto active_nozzle = get_actual_nozzle_volume_type(active_index);
     int from_index = get_index_for_extruder(active_index, active_nozzle);
-    int dest_index = get_index_for_extruder(1 - active_index, active_nozzle);
+    int dest_index = get_index_for_extruder(target_extruder, active_nozzle);
     if (from_index < 0 || dest_index < 0) // no variant column for this nozzle on one of the extruders
         return;
-    auto dirty_options = m_presets->current_dirty_options(true);
     DynamicConfig config_origin, config_to_apply;
-    for (int i = 0; i < dirty_options.size(); ++i) {
-        auto &opt = dirty_options[i];
-        auto n= opt.find('#');
-        if (n == std::string::npos)
-            continue;
-        auto field = m_active_page->get_field(opt.substr(0, n), from_index + 256);
-        auto line  = m_active_page->get_line(opt.substr(0, n), from_index + 256);
-        if (field == nullptr || line == nullptr)
-            continue;
-        ++n;
-        auto is_from_slot = [&](const std::string &dirty_opt) {
-            int slot = std::atoi(dirty_opt.c_str() + n);
-            return slot >= from_index && slot < from_index + stride;
-        };
-        bool dirty = is_from_slot(opt);
-        while (i + 1 < dirty_options.size() && dirty_options[i + 1].compare(0, n, opt, 0, n) == 0) {
-            dirty |= is_from_slot(dirty_options[i + 1]);
-            ++i;
+    if (copy_process_page) {
+        t_config_option_keys page_keys;
+        for (const auto& key : print_options_with_variant) {
+            if (m_active_page->get_field(key, from_index + 256) &&
+                m_active_page->get_line(key, from_index + 256))
+                page_keys.push_back(key);
         }
-        if (dirty) {
-            auto key = opt.substr(0, n - 1);
-            auto option = dynamic_cast<ConfigOptionVectorBase*>(m_config->option(key));
-            auto option2 = dynamic_cast<ConfigOptionVectorBase*>(option->clone());
-            for (int s = 0; s < stride; ++s)
-                option2->set_at(option, dest_index + s, from_index + s);
-            if (*option == *option2) {
-                delete option2;
+        config_to_apply = process_tool_sync_changes(*m_config, page_keys, from_index, dest_index);
+        for (const auto& key : config_to_apply.keys())
+            config_origin.set_key_value(key, m_config->option(key)->clone());
+    } else {
+        auto dirty_options = m_presets->current_dirty_options(true);
+        for (int i = 0; i < dirty_options.size(); ++i) {
+            auto &opt = dirty_options[i];
+            auto n= opt.find('#');
+            if (n == std::string::npos)
                 continue;
+            auto field = m_active_page->get_field(opt.substr(0, n), from_index + 256);
+            auto line  = m_active_page->get_line(opt.substr(0, n), from_index + 256);
+            if (field == nullptr || line == nullptr)
+                continue;
+            ++n;
+            auto is_from_slot = [&](const std::string &dirty_opt) {
+                int slot = std::atoi(dirty_opt.c_str() + n);
+                return slot >= from_index && slot < from_index + stride;
+            };
+            bool dirty = is_from_slot(opt);
+            while (i + 1 < dirty_options.size() && dirty_options[i + 1].compare(0, n, opt, 0, n) == 0) {
+                dirty |= is_from_slot(dirty_options[i + 1]);
+                ++i;
             }
-            config_origin.set_key_value(key, option->clone());
-            config_to_apply.set_key_value(key, option2);
+            if (dirty) {
+                auto key = opt.substr(0, n - 1);
+                auto option = dynamic_cast<ConfigOptionVectorBase*>(m_config->option(key));
+                auto option2 = dynamic_cast<ConfigOptionVectorBase*>(option->clone());
+                for (int s = 0; s < stride; ++s)
+                    option2->set_at(option, dest_index + s, from_index + s);
+                if (*option == *option2) {
+                    delete option2;
+                    continue;
+                }
+                config_origin.set_key_value(key, option->clone());
+                config_to_apply.set_key_value(key, option2);
+            }
         }
     }
     if (config_to_apply.empty()) {
-        MessageDialog md(wxGetApp().plater(), _L("No modifications need to be copied."), _L("Copy parameters"), wxICON_INFORMATION | wxOK);
+        MessageDialog md(wxGetApp().plater(), copy_process_page ? _L("The selected tools already have matching values on this page.") : _L("No modifications need to be copied."), _L("Copy parameters"), wxICON_INFORMATION | wxOK);
         md.ShowModal();
         return;
     }
 
     std::string pt = m_preset_bundle->printers.get_edited_preset().get_printer_type(m_preset_bundle);
-    std::string active_nozzle_name = DevPrinterConfigUtil::get_toolhead_display_name(pt, active_index, ToolHeadComponent::Nozzle, ToolHeadNameCase::LowerCase);
-    std::string other_nozzle_name  = DevPrinterConfigUtil::get_toolhead_display_name(pt, 1 - active_index, ToolHeadComponent::Nozzle, ToolHeadNameCase::LowerCase);
-    wxString title  = wxString::Format(_L("Modify parameters of %s"), _L(active_nozzle_name));
-    wxString header = wxString::Format(_L("Do you want to modify the following parameters of the %s to that of the %s?"),
-                                       _L(active_nozzle_name), _L(other_nozzle_name));
-    UnsavedChangesDialog dlg(title, header, &config_origin, from_index, dest_index, active_index == 0, active_nozzle);
+    std::string active_nozzle_name, other_nozzle_name;
+    if (copy_process_page && tool_count > 2) {
+        active_nozzle_name = "T" + std::to_string(active_index + 1);
+        other_nozzle_name = "T" + std::to_string(target_extruder + 1);
+    } else {
+        active_nozzle_name = DevPrinterConfigUtil::get_toolhead_display_name(pt, active_index, ToolHeadComponent::Nozzle, ToolHeadNameCase::LowerCase);
+        other_nozzle_name = DevPrinterConfigUtil::get_toolhead_display_name(pt, target_extruder, ToolHeadComponent::Nozzle, ToolHeadNameCase::LowerCase);
+    }
+    wxString title  = wxString::Format(_L("Modify parameters of %s"), _L(other_nozzle_name));
+    wxString header = copy_process_page ?
+        format_wxstr(_L("Copy this page's parameters from %1% to %2%?"), _L(active_nozzle_name), _L(other_nozzle_name)) :
+        wxString::Format(_L("Do you want to modify the following parameters of the %s to that of the %s?"),
+                         _L(active_nozzle_name), _L(other_nozzle_name));
+    const bool source_in_left_column = (copy_process_page && tool_count > 2) || active_index == 0;
+    UnsavedChangesDialog dlg(title, header, &config_origin, from_index, dest_index, source_in_left_column,
+                             active_nozzle, active_index, target_extruder);
     dlg.ShowModal();
     if (dlg.transfer_changes()) {
         m_config->apply(config_to_apply);
@@ -10099,3 +10179,4 @@ ConfigManipulation Tab::get_config_manipulation()
 
 } // GUI
 } // Slic3r
+

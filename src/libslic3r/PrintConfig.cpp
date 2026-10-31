@@ -6409,6 +6409,15 @@ void PrintConfigDef::init_fff_params()
     def->tooltip = "Default extruder id to place filament.";
     def->set_default_value(new ConfigOptionInt{ 1 });
 
+    def = this->add("share_process_settings", coBool);
+    def->label = L("Share print settings across tools");
+    def->category = L("Multimaterial");
+    def->tooltip = L("Use the first process settings column for every tool, including speed, acceleration, jerk and process flow settings. "
+                     "Tool changes and each tool's printer and filament settings remain independent. "
+                     "Per-tool process values are retained and used again when this option is disabled.");
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionBool(false));
+
     def = this->add("print_extruder_id", coInts);
     // internal use only, don't need translation
     def->label = "Print extruder id";
@@ -11589,6 +11598,22 @@ int DynamicPrintConfig::get_extruder_nozzle_volume_count(int extruder_count, std
     return count;
 }
 
+void DynamicPrintConfig::apply_shared_process_settings()
+{
+    const auto* shared = this->option<ConfigOptionBool>("share_process_settings");
+    if (!shared || !shared->value)
+        return;
+    // Call on the slicing copy, preserving the editable profile and all hardware maps.
+    for (const std::string &key : print_options_with_variant) {
+        if (key == "print_extruder_id" || key == "print_extruder_variant")
+            continue;
+        auto* values = dynamic_cast<ConfigOptionVectorBase*>(this->option(key));
+        if (values)
+            for (size_t i = 1; i < values->size(); ++i)
+                values->set_at(values, i, 0);
+    }
+}
+
 // Orca: BBL system profiles ship full-width print_extruder_id/print_extruder_variant columns, but
 // custom multi-extruder printers only ever get the machine-scope columns synthesized for them (see
 // extend_extruder_variant); the process scope keeps the length-1 defaults, both in presets and in
@@ -11597,34 +11622,42 @@ int DynamicPrintConfig::get_extruder_nozzle_volume_count(int extruder_count, std
 // full-width-but-wrong [1,1,...] map that also defeats the generated_extruder_id fallback in
 // get_index_for_extruder. Synthesize the process columns from the printer's extruder_variant_list
 // (same token walk as extend_extruder_variant) before expanding.
-static void ensure_process_variant_columns(DynamicPrintConfig &config, const DynamicPrintConfig &printer_config)
+void DynamicPrintConfig::ensure_process_variant_columns(const DynamicPrintConfig &printer_config)
 {
-    auto id_opt      = dynamic_cast<ConfigOptionInts *>(config.option("print_extruder_id"));
-    auto variant_opt = dynamic_cast<ConfigOptionStrings *>(config.option("print_extruder_variant"));
-    auto list_opt    = dynamic_cast<const ConfigOptionStrings *>(printer_config.option("extruder_variant_list"));
+    auto id_opt      = this->option<ConfigOptionInts>("print_extruder_id");
+    auto variant_opt = this->option<ConfigOptionStrings>("print_extruder_variant");
+    auto list_opt    = printer_config.option<ConfigOptionStrings>("extruder_variant_list");
     if (!id_opt || !variant_opt || !list_opt)
         return;
-    if (id_opt->values.size() != 1 || variant_opt->values.size() != 1)
-        return;
 
-    std::vector<int>         ids;
-    std::vector<std::string> variants;
-    for (int i = 0; i < int(list_opt->values.size()); ++i) {
-        std::vector<std::string> tokens;
-        boost::split(tokens, list_opt->get_at(i), boost::is_any_of(","), boost::token_compress_on);
-        for (std::string &token : tokens) {
-            boost::trim(token);
-            if (token.empty())
-                continue;
-            ids.push_back(i + 1);
-            variants.push_back(token);
+    if (id_opt->values.size() == 1 && variant_opt->values.size() == 1) {
+        std::vector<int> ids;
+        std::vector<std::string> variants;
+        for (size_t i = 0; i < list_opt->values.size(); ++i) {
+            std::vector<std::string> tokens;
+            boost::split(tokens, list_opt->get_at(i), boost::is_any_of(","), boost::token_compress_on);
+            for (std::string &token : tokens) {
+                boost::trim(token);
+                if (token.empty())
+                    continue;
+                ids.push_back(static_cast<int>(i) + 1);
+                variants.push_back(token);
+            }
+        }
+        if (ids.size() > 1) {
+            id_opt->values = std::move(ids);
+            variant_opt->values = std::move(variants);
         }
     }
-    // A single column is the legitimate single-extruder layout, not a degenerate one.
-    if (ids.size() <= 1)
-        return;
-    id_opt->values      = std::move(ids);
-    variant_opt->values = std::move(variants);
+    // The GUI must be able to edit every column, not just read get_at()'s fallback.
+    // Only extend arrays; retain existing per-tool values and hybrid columns.
+    for (const std::string &key : print_options_with_variant) {
+        if (key == "print_extruder_id" || key == "print_extruder_variant")
+            continue;
+        auto* values = dynamic_cast<ConfigOptionVectorBase*>(this->option(key));
+        if (values && values->size() > 0 && values->size() < variant_opt->size())
+            values->resize(variant_opt->size(), values);
+    }
 }
 
 std::vector<int> DynamicPrintConfig::update_values_to_printer_extruders(DynamicPrintConfig& printer_config, int extruder_count, int extruder_nozzle_volume_count, std::vector<std::vector<NozzleVolumeType>>& nv_types,
@@ -11669,7 +11702,7 @@ std::vector<int> DynamicPrintConfig::update_values_to_printer_extruders(DynamicP
     }
     else {
         if (id_name == "print_extruder_id")
-            ensure_process_variant_columns(*this, printer_config);
+            ensure_process_variant_columns(printer_config);
         // Orca: emit the slots first, then size variant_count from what was actually
         // emitted. extruder_nozzle_volume_count only equals the emitted total when every
         // extruder carries per-type stats; an extruder with an empty stats entry combined
@@ -14427,3 +14460,4 @@ bool is_XL_printer(const PrintConfig &cfg)
 #include <cereal/types/polymorphic.hpp>
 CEREAL_REGISTER_TYPE(Slic3r::DynamicPrintConfig)
 CEREAL_REGISTER_POLYMORPHIC_RELATION(Slic3r::DynamicConfig, Slic3r::DynamicPrintConfig)
+
